@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.1 - 2026-05-05
+
+### Added
+
+- `cargo-binstall` metadata for GitHub Release binary installs.
+- Normal GitHub Actions CI for formatting, tests, feature-gated checks, clippy,
+  and packaging.
+
+### Changed
+
+- Updated install documentation for the published crate, cargo-dist installers,
+  and cargo-binstall.
+
 ## 0.1.0 - 2026-05-05
 
 Initial release.
