@@ -1,6 +1,7 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::time::Duration;
 
 #[cfg(feature = "server")]
 use std::io::Write;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 #[cfg(feature = "server")]
 use axum::body::Body;
 #[cfg(feature = "server")]
-use axum::extract::{Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
 #[cfg(feature = "server")]
 use axum::http::{header, HeaderMap, StatusCode};
 #[cfg(feature = "server")]
@@ -32,6 +33,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 
 type AnyError = Box<dyn std::error::Error + Send + Sync + 'static>;
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 300;
+const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 15;
+#[cfg(feature = "server")]
+const DEFAULT_MAX_UPLOAD_MB: u64 = 50;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Unofficial Codex Desktop ASR client")]
@@ -61,6 +66,14 @@ struct Cli {
     /// HTTPS proxy URL. Defaults to CODEX_ASR_PROXY, HTTPS_PROXY, ALL_PROXY, or macOS system proxy.
     #[arg(long, global = true)]
     proxy: Option<String>,
+
+    /// Total upstream request timeout in seconds. Defaults to CODEX_ASR_REQUEST_TIMEOUT_SECONDS or 300.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    request_timeout_seconds: Option<u64>,
+
+    /// Upstream connect timeout in seconds. Defaults to CODEX_ASR_CONNECT_TIMEOUT_SECONDS or 15.
+    #[arg(long, global = true, value_name = "SECONDS")]
+    connect_timeout_seconds: Option<u64>,
 
     /// BCP-47-ish language hint, for example zh or en.
     #[arg(long, global = true)]
@@ -119,6 +132,10 @@ enum Command {
         /// Maximum concurrent upstream transcribe requests.
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
+
+        /// Maximum accepted REST upload size in MiB. Defaults to CODEX_ASR_MAX_UPLOAD_MB or 50.
+        #[arg(long, value_name = "MIB")]
+        max_upload_mb: Option<u64>,
     },
 }
 
@@ -153,6 +170,8 @@ fn run_transcribe(cli: Cli) -> Result<(), AnyError> {
     let client = CodexAsrClient::builder(auth)
         .endpoint(cli.endpoint.clone())
         .proxy(cli.proxy.clone().or_else(|| codex_asr::resolve_proxy(None)))
+        .timeout(Some(resolve_request_timeout(&cli)?))
+        .connect_timeout(Some(resolve_connect_timeout(&cli)?))
         .build()?;
     let silk = SilkDecodeConfig::from_cli(&cli);
     let decoded_silk = maybe_decode_silk(&audio, &silk)?;
@@ -196,6 +215,103 @@ fn load_auth(cli: &Cli) -> codex_asr::Result<CodexAuth> {
         return CodexAuth::from_auth_file(path);
     }
     CodexAuth::from_codex_home()
+}
+
+#[cfg(feature = "server")]
+#[derive(Debug, Clone)]
+enum AuthSource {
+    Bearer {
+        token: String,
+        account_id: Option<String>,
+    },
+    File(PathBuf),
+}
+
+#[cfg(feature = "server")]
+impl AuthSource {
+    fn from_cli(cli: &Cli) -> codex_asr::Result<Self> {
+        if let Some(bearer) = cli
+            .bearer
+            .clone()
+            .or_else(|| std::env::var("CODEX_ASR_BEARER").ok())
+        {
+            let source = Self::Bearer {
+                token: bearer,
+                account_id: cli.account_id.clone(),
+            };
+            source.load()?;
+            return Ok(source);
+        }
+        let path = cli
+            .auth_file
+            .clone()
+            .unwrap_or_else(codex_asr::default_auth_file);
+        let source = Self::File(path);
+        source.load()?;
+        Ok(source)
+    }
+
+    fn load(&self) -> codex_asr::Result<CodexAuth> {
+        match self {
+            Self::Bearer { token, account_id } => CodexAuth::from_bearer(token, account_id.clone()),
+            Self::File(path) => CodexAuth::from_auth_file(path),
+        }
+    }
+}
+
+fn resolve_request_timeout(cli: &Cli) -> Result<Duration, AnyError> {
+    resolve_seconds(
+        cli.request_timeout_seconds,
+        &[
+            "CODEX_ASR_REQUEST_TIMEOUT_SECONDS",
+            "CODEX_ASR_TIMEOUT_SECONDS",
+        ],
+        DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        "request timeout",
+    )
+}
+
+fn resolve_connect_timeout(cli: &Cli) -> Result<Duration, AnyError> {
+    resolve_seconds(
+        cli.connect_timeout_seconds,
+        &["CODEX_ASR_CONNECT_TIMEOUT_SECONDS"],
+        DEFAULT_CONNECT_TIMEOUT_SECONDS,
+        "connect timeout",
+    )
+}
+
+fn resolve_seconds(
+    explicit: Option<u64>,
+    env_names: &[&str],
+    default: u64,
+    label: &str,
+) -> Result<Duration, AnyError> {
+    let seconds = if let Some(value) = explicit {
+        value
+    } else {
+        resolve_u64_env(env_names)?.unwrap_or(default)
+    };
+    if seconds == 0 {
+        return Err(format!("{label} must be greater than 0 seconds").into());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn resolve_u64_env(env_names: &[&str]) -> Result<Option<u64>, AnyError> {
+    for name in env_names {
+        let Ok(value) = env::var(name) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let parsed = value
+            .parse::<u64>()
+            .map_err(|_| format!("{name} must be a positive integer"))?;
+        return Ok(Some(parsed));
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +456,7 @@ fn run_serve(cli: &Cli) -> Result<(), AnyError> {
         api_key,
         no_api_key,
         concurrency,
+        max_upload_mb,
     }) = &cli.command
     else {
         unreachable!("run_serve only handles the serve subcommand");
@@ -348,15 +465,18 @@ fn run_serve(cli: &Cli) -> Result<(), AnyError> {
         return Err("--concurrency must be greater than 0".into());
     }
     let api_key = resolve_server_api_key(api_key.clone(), *no_api_key)?;
-    let auth = load_auth(cli)?;
-    let client = CodexAsrClient::builder(auth)
-        .endpoint(cli.endpoint.clone())
-        .proxy(cli.proxy.clone().or_else(|| codex_asr::resolve_proxy(None)))
-        .build()?;
+    let auth_source = AuthSource::from_cli(cli)?;
+    let request_timeout = resolve_request_timeout(cli)?;
+    let connect_timeout = resolve_connect_timeout(cli)?;
+    let max_upload_bytes = resolve_max_upload_bytes(*max_upload_mb)?;
     let state = ServerState {
-        client: Arc::new(client),
         api_key: api_key.map(Arc::from),
         semaphore: Arc::new(Semaphore::new(*concurrency)),
+        auth_source,
+        endpoint: Arc::from(cli.endpoint.as_str()),
+        proxy: cli.proxy.clone().or_else(|| codex_asr::resolve_proxy(None)),
+        request_timeout,
+        connect_timeout,
         silk: SilkDecodeConfig::from_cli(cli),
         default_language: cli.language.clone(),
     };
@@ -364,7 +484,7 @@ fn run_serve(cli: &Cli) -> Result<(), AnyError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve_http(addr, state))
+    runtime.block_on(serve_http(addr, state, max_upload_bytes))
 }
 
 #[cfg(not(feature = "server"))]
@@ -390,15 +510,38 @@ fn resolve_server_api_key(
 }
 
 #[cfg(feature = "server")]
-async fn serve_http(addr: SocketAddr, state: ServerState) -> Result<(), AnyError> {
+fn resolve_max_upload_bytes(explicit_mb: Option<u64>) -> Result<usize, AnyError> {
+    let mb = explicit_mb
+        .or(resolve_u64_env(&["CODEX_ASR_MAX_UPLOAD_MB"])?)
+        .unwrap_or(DEFAULT_MAX_UPLOAD_MB);
+    if mb == 0 {
+        return Err("max upload size must be greater than 0 MiB".into());
+    }
+    let bytes = mb
+        .checked_mul(1024)
+        .and_then(|value| value.checked_mul(1024))
+        .ok_or("max upload size is too large")?;
+    usize::try_from(bytes).map_err(|_| "max upload size is too large".into())
+}
+
+#[cfg(feature = "server")]
+async fn serve_http(
+    addr: SocketAddr,
+    state: ServerState,
+    max_upload_bytes: usize,
+) -> Result<(), AnyError> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .route("/audio/transcriptions", post(transcriptions))
+        .layer(DefaultBodyLimit::max(max_upload_bytes))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
     let actual = listener.local_addr()?;
-    eprintln!("codex-asr listening on http://{actual}");
+    eprintln!(
+        "codex-asr listening on http://{actual} (max upload: {} MiB)",
+        max_upload_bytes / 1024 / 1024
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -406,9 +549,13 @@ async fn serve_http(addr: SocketAddr, state: ServerState) -> Result<(), AnyError
 #[cfg(feature = "server")]
 #[derive(Clone)]
 struct ServerState {
-    client: Arc<CodexAsrClient>,
     api_key: Option<Arc<str>>,
     semaphore: Arc<Semaphore>,
+    auth_source: AuthSource,
+    endpoint: Arc<str>,
+    proxy: Option<String>,
+    request_timeout: Duration,
+    connect_timeout: Duration,
     silk: SilkDecodeConfig,
     default_language: Option<String>,
 }
@@ -433,12 +580,11 @@ async fn transcriptions(
         .acquire_owned()
         .await
         .map_err(|_| ApiError::internal("concurrency limiter is closed"))?;
-    let client = state.client.as_ref().clone();
-    let silk = state.silk.clone();
+    let worker_state = state.clone();
     let language = request.language.clone();
     let transcription = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        transcribe_uploaded_file(client, silk, request)
+        transcribe_uploaded_file(worker_state, request)
     })
     .await
     .map_err(|error| ApiError::internal(format!("transcribe worker failed: {error}")))??;
@@ -489,7 +635,7 @@ async fn parse_transcription_multipart(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|error| ApiError::bad_request(format!("invalid multipart body: {error}")))?
+        .map_err(|error| multipart_error(error, "invalid multipart body"))?
     {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -499,9 +645,10 @@ async fn parse_transcription_multipart(
                     .content_type()
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| codex_asr::infer_content_type(&raw_filename).to_string());
-                let bytes = field.bytes().await.map_err(|error| {
-                    ApiError::bad_request(format!("failed to read file: {error}"))
-                })?;
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|error| multipart_error(error, "failed to read file"))?;
                 if bytes.is_empty() {
                     return Err(ApiError::bad_request("file is empty"));
                 }
@@ -566,17 +713,31 @@ async fn read_text_field(field: axum::extract::multipart::Field<'_>) -> Result<S
         .text()
         .await
         .map(|text| text.trim().to_string())
-        .map_err(|error| ApiError::bad_request(format!("failed to read text field: {error}")))
+        .map_err(|error| multipart_error(error, "failed to read text field"))
+}
+
+#[cfg(feature = "server")]
+fn multipart_error(error: axum::extract::multipart::MultipartError, context: &str) -> ApiError {
+    let display = error.to_string();
+    let detail = format!("{error:?}");
+    if detail.contains("LengthLimitError")
+        || detail.contains("length limit")
+        || (context.starts_with("failed to read")
+            && display.contains("Error parsing `multipart/form-data` request"))
+    {
+        ApiError::payload_too_large("multipart body exceeds the configured upload limit")
+    } else {
+        ApiError::bad_request(format!("{context}: {error}"))
+    }
 }
 
 #[cfg(feature = "server")]
 fn transcribe_uploaded_file(
-    client: CodexAsrClient,
-    silk: SilkDecodeConfig,
+    state: ServerState,
     request: TranscriptionRequest,
 ) -> Result<codex_asr::Transcription, ApiError> {
     let uploaded_path = request.file.path().to_path_buf();
-    let decoded_silk = maybe_decode_silk(&uploaded_path, &silk)
+    let decoded_silk = maybe_decode_silk(&uploaded_path, &state.silk)
         .map_err(|error| ApiError::bad_request(format!("{error}")))?;
     let upload_audio = decoded_silk
         .as_ref()
@@ -591,6 +752,17 @@ fn transcribe_uploaded_file(
     } else {
         Some(request.content_type)
     };
+    let auth = state
+        .auth_source
+        .load()
+        .map_err(|error| ApiError::internal(format!("failed to load Codex auth: {error}")))?;
+    let client = CodexAsrClient::builder(auth)
+        .endpoint(state.endpoint.as_ref().to_string())
+        .proxy(state.proxy)
+        .timeout(Some(state.request_timeout))
+        .connect_timeout(Some(state.connect_timeout))
+        .build()
+        .map_err(|error| ApiError::internal(format!("failed to build ASR client: {error}")))?;
     client
         .transcribe_file(
             upload_audio,
@@ -862,6 +1034,14 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
             error_type: "authentication_error",
+        }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            error_type: "invalid_request_error",
         }
     }
 

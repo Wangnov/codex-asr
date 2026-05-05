@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use base64::prelude::*;
 use reqwest::blocking::{multipart, Client};
@@ -204,6 +205,8 @@ pub struct CodexAsrClientBuilder {
     auth: CodexAuth,
     endpoint: String,
     proxy: Option<String>,
+    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
     originator: String,
     user_agent: String,
 }
@@ -216,6 +219,8 @@ impl CodexAsrClientBuilder {
             auth,
             endpoint: DEFAULT_ENDPOINT.to_string(),
             proxy: resolve_proxy(None),
+            timeout: None,
+            connect_timeout: None,
             originator: DEFAULT_ORIGINATOR.to_string(),
             user_agent: format!(
                 "{DEFAULT_ORIGINATOR}/{version} ({}; {})",
@@ -235,6 +240,16 @@ impl CodexAsrClientBuilder {
         self
     }
 
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
     pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
         self.user_agent = user_agent.into();
         self
@@ -245,6 +260,12 @@ impl CodexAsrClientBuilder {
         if let Some(proxy) = self.proxy {
             builder =
                 builder.proxy(reqwest::Proxy::https(&proxy).map_err(CodexAsrError::BuildClient)?);
+        }
+        if let Some(timeout) = self.timeout {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = self.connect_timeout {
+            builder = builder.connect_timeout(timeout);
         }
         let http = builder.build().map_err(CodexAsrError::BuildClient)?;
         Ok(CodexAsrClient {
