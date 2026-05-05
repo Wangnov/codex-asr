@@ -1,0 +1,7 @@
+.git
+.github
+target
+deploy
+*.crate
+.DS_Store
+*.log

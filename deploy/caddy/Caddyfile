@@ -1,0 +1,4 @@
+{$CODEX_ASR_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy codex-asr:8788
+}

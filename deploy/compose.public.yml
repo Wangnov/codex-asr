@@ -1,0 +1,45 @@
+services:
+  codex-asr:
+    image: ghcr.io/wangnov/codex-asr:latest
+    restart: unless-stopped
+    expose:
+      - "8788"
+    environment:
+      CODEX_ASR_SERVER_KEY: ${CODEX_ASR_SERVER_KEY:?set CODEX_ASR_SERVER_KEY}
+      CODEX_ASR_PROXY: ${CODEX_ASR_PROXY:-}
+      CODEX_ASR_SILK_DECODER: ${CODEX_ASR_SILK_DECODER:-}
+    command:
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8788"
+      - --auth-file
+      - /run/secrets/codex_auth
+      - --concurrency
+      - ${CODEX_ASR_CONCURRENCY:-16}
+    secrets:
+      - codex_auth
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - codex-asr
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CODEX_ASR_DOMAIN: ${CODEX_ASR_DOMAIN:?set CODEX_ASR_DOMAIN}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+secrets:
+  codex_auth:
+    file: ${CODEX_ASR_AUTH_FILE:?set CODEX_ASR_AUTH_FILE}
+
+volumes:
+  caddy_data:
+  caddy_config:

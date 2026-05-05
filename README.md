@@ -13,6 +13,7 @@
   <a href="https://crates.io/crates/codex-asr"><img src="https://img.shields.io/crates/v/codex-asr?logo=rust" alt="Crates.io"></a>
   <a href="https://docs.rs/codex-asr"><img src="https://img.shields.io/docsrs/codex-asr?logo=docs.rs" alt="docs.rs"></a>
   <a href="https://github.com/Wangnov/codex-asr/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Wangnov/codex-asr/ci.yml?branch=main&label=ci" alt="CI"></a>
+  <a href="https://github.com/Wangnov/codex-asr/actions/workflows/docker.yml"><img src="https://img.shields.io/github/actions/workflow/status/Wangnov/codex-asr/docker.yml?branch=main&label=docker" alt="Docker"></a>
   <a href="https://github.com/Wangnov/codex-asr/actions/workflows/release.yml"><img src="https://img.shields.io/badge/release-cargo--dist-2ea44f" alt="cargo-dist release automation"></a>
   <a href="https://github.com/Wangnov/codex-asr/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-MIT-2ea44f" alt="MIT license"></a>
 </p>
@@ -22,7 +23,7 @@
 </p>
 
 <p align="center">
-  crates.io · cargo-binstall · GitHub Release · Rust library · local REST
+  crates.io · cargo-binstall · Homebrew · Docker / GHCR · Rust library · local REST
 </p>
 
 ---
@@ -87,6 +88,15 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/Wangnov/codex-asr/
 
 从 [最新 GitHub Release](https://github.com/Wangnov/codex-asr/releases/latest)
 下载对应平台的压缩包或安装脚本。
+
+### Docker / GHCR
+
+```bash
+docker pull ghcr.io/wangnov/codex-asr:latest
+docker run --rm ghcr.io/wangnov/codex-asr:latest --version
+```
+
+`main` 分支会通过 GitHub Actions 发布 `latest` 和当前 crate 版本标签。
 
 ### 从当前源码安装
 
@@ -162,6 +172,46 @@ REST 字段兼容范围：
 
 `srt` 和 `vtt` 会返回 HTTP 400，因为 Codex 这个端点不返回时间戳。
 
+## Docker 公网部署
+
+这个部署形态只承诺三件事：公网端口、HTTPS、api-key。`deploy/compose.public.yml`
+用 Caddy 自动申请证书，把 80/443 暴露到公网，再反代到容器里的
+`codex-asr serve`。应用层鉴权使用 `Authorization: Bearer <CODEX_ASR_SERVER_KEY>`。
+
+前置条件：
+
+- 域名 A/AAAA 记录已经指向服务器
+- 服务器公网防火墙放行 80 和 443
+- 服务器上已有可用的 Codex / ChatGPT auth 文件
+
+```bash
+cp deploy/env.public.example deploy/.env
+$EDITOR deploy/.env
+docker compose --env-file deploy/.env -f deploy/compose.public.yml up -d
+```
+
+`deploy/.env` 里至少要设置：
+
+```bash
+CODEX_ASR_DOMAIN=asr.example.com
+CODEX_ASR_AUTH_FILE=/absolute/path/to/codex-auth.json
+CODEX_ASR_SERVER_KEY=replace-with-a-long-random-api-key
+```
+
+调用示例：
+
+```bash
+curl https://asr.example.com/healthz
+
+curl https://asr.example.com/v1/audio/transcriptions \
+  -H "Authorization: Bearer replace-with-a-long-random-api-key" \
+  -F model=whisper-1 \
+  -F file=@audio.wav
+```
+
+如果容器里也要处理 `.silk` / 微信语音，需要额外把外部 `rust-silk` CLI 挂进容器，
+并设置 `CODEX_ASR_SILK_DECODER` 指向容器内路径。
+
 ## 命令说明
 
 - `codex-asr <audio>`：默认等同于 `codex-asr transcribe <audio>`
@@ -235,12 +285,13 @@ codex-asr audio.wav --bearer "$TOKEN" --account-id acct_...
 
 ## 安全边界
 
-`codex-asr` 会复用你的个人 Codex / ChatGPT 登录 token。不要把它或由它驱动的
-REST server 暴露到公网。
+`codex-asr` 会复用你的个人 Codex / ChatGPT 登录 token。不要裸露 HTTP 或无
+api-key 的 REST server；公网部署至少使用 HTTPS 和应用层 api-key。
 
 - REST 默认绑定 `127.0.0.1`
 - 本地 REST key 只是本地访问控制，不是 OpenAI 或 ChatGPT token
 - 只有在可信本机回环环境里才使用 `--no-api-key`
+- `deploy/compose.public.yml` 的公网形态默认启用 Caddy HTTPS 和 REST api-key
 - 这个端点是从 Codex Desktop 行为逆向出来的，可能随 Codex App 更新而变化
 
 ## 音频格式
@@ -396,6 +447,16 @@ powershell -ExecutionPolicy ByPass -c "irm https://github.com/Wangnov/codex-asr/
 Download the matching archive or installer from the
 [latest GitHub Release](https://github.com/Wangnov/codex-asr/releases/latest).
 
+### Docker / GHCR
+
+```bash
+docker pull ghcr.io/wangnov/codex-asr:latest
+docker run --rm ghcr.io/wangnov/codex-asr:latest --version
+```
+
+The `main` branch publishes `latest` and the current crate-version tag through
+GitHub Actions.
+
 ### From this checkout
 
 ```bash
@@ -471,6 +532,48 @@ Multipart fields:
 `srt` and `vtt` return HTTP 400 because the Codex endpoint does not return
 timestamps.
 
+## Public Docker Deployment
+
+This deployment shape is intentionally small: a public port, HTTPS, and an
+application API key. `deploy/compose.public.yml` uses Caddy to obtain TLS
+certificates on ports 80/443 and reverse proxy to `codex-asr serve` inside the
+private Docker network. App auth is `Authorization: Bearer <CODEX_ASR_SERVER_KEY>`.
+
+Prerequisites:
+
+- The domain A/AAAA record points at the server
+- The server firewall allows ports 80 and 443
+- A usable Codex / ChatGPT auth file exists on the server
+
+```bash
+cp deploy/env.public.example deploy/.env
+$EDITOR deploy/.env
+docker compose --env-file deploy/.env -f deploy/compose.public.yml up -d
+```
+
+Set at least these values in `deploy/.env`:
+
+```bash
+CODEX_ASR_DOMAIN=asr.example.com
+CODEX_ASR_AUTH_FILE=/absolute/path/to/codex-auth.json
+CODEX_ASR_SERVER_KEY=replace-with-a-long-random-api-key
+```
+
+Example requests:
+
+```bash
+curl https://asr.example.com/healthz
+
+curl https://asr.example.com/v1/audio/transcriptions \
+  -H "Authorization: Bearer replace-with-a-long-random-api-key" \
+  -F model=whisper-1 \
+  -F file=@audio.wav
+```
+
+To process `.silk` / WeChat voice files inside Docker, mount an external
+`rust-silk` CLI into the container and set `CODEX_ASR_SILK_DECODER` to its
+container path.
+
 ## Commands
 
 - `codex-asr <audio>`: same as `codex-asr transcribe <audio>`
@@ -544,12 +647,14 @@ Environment variables:
 
 ## Safety
 
-`codex-asr` reuses a personal Codex / ChatGPT login token. Do not expose it, or a
-REST server backed by it, to the public internet.
+`codex-asr` reuses a personal Codex / ChatGPT login token. Do not expose plain
+HTTP or an unauthenticated REST server; public deployment should use at least
+HTTPS and an application API key.
 
 - REST binds to `127.0.0.1` by default
 - The REST API key is local access control only; it is not an OpenAI or ChatGPT token
 - Use `--no-api-key` only on trusted loopback
+- `deploy/compose.public.yml` enables Caddy HTTPS and REST api-key auth by default
 - This endpoint is reverse-engineered from Codex Desktop behavior and may change without notice
 
 ## Audio formats
