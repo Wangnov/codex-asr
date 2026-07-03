@@ -360,6 +360,7 @@ codex-asr raw-audio --content-type audio/wav --filename voice.wav
 - 非常短的非静音片段可能返回不稳定文本
 - `prompt`、`temperature`、`timestamp_granularities` 只为 SDK 兼容而接受，不会影响上游
 - 本地短 WAV 并发测试到 96 个请求没有出现 429/5xx，但这不是公开 API 承诺
+- 为保证完整转写，单个音频建议不要超过 11 分钟，长音频请先切分
 - 建议 REST wrapper 对长音频保持有界并发，默认 `--concurrency 16`
 - REST server 默认限制上传体积为 `50` MiB，上游请求总超时为 `300` 秒
 
@@ -743,6 +744,7 @@ codex-asr raw-audio --content-type audio/wav --filename voice.wav
 - Very short non-silent clips can return unstable text
 - `prompt`, `temperature`, and `timestamp_granularities` are accepted only for SDK compatibility
 - Local short-WAV probes reached 96 concurrent requests without 429/5xx, but that is not a public API contract
+- For reliable full transcripts, keep each audio file under 11 minutes and split longer recordings first
 - Keep long-audio REST usage bounded; the default is `--concurrency 16`
 - The REST server defaults to a `50` MiB upload limit and a `300` second upstream request timeout
 
